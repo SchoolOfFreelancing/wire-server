@@ -15,11 +15,16 @@
 -- You should have received a copy of the GNU Affero General Public License along
 -- with this program. If not, see <https://www.gnu.org/licenses/>.
 
-module Test.SerializationSpec where
+module Wire.API.Federation.API where
 
-import Imports
-import Test.Hspec
+import GHC.Generics (Generic)
+import Servant.API.Generic ((:-), AsApi, ToServant)
+import qualified Wire.API.Federation.API.Conversation as Conversation (Api)
 
-spec :: Spec
-spec = do
-  pure ()
+type PlainApi = ToServant Api AsApi
+
+-- FUTUREWORK: Add Swagger docs
+data Api routes = Api
+  { conversation :: routes :- ToServant Conversation.Api AsApi
+  }
+  deriving stock (Generic)
