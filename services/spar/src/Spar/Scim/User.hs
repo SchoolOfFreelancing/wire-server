@@ -250,9 +250,9 @@ validateScimUser' midp richInfoLimit user = do
 mkUserRef ::
   forall m.
   (MonadError Scim.ScimError m) =>
-  IdP ->
+  Maybe IdP ->
   Maybe Text ->
-  m SAML.UserRef
+  m (Maybe SAML.UserRef)
 mkUserRef idp extid = case extid of
   Just subjectTxt -> do
     let issuer = idp ^. SAML.idpMetadata . SAML.edIssuer
@@ -260,6 +260,8 @@ mkUserRef idp extid = case extid of
     pure $ SAML.UserRef issuer subject
   Nothing ->
     throwError $
+      -- TODO: wait -- do we still want to require externalId if we don't want to require SAML
+      -- any more?
       Scim.badRequest
         Scim.InvalidValue
         (Just "externalId is required for SAML users")
@@ -632,8 +634,8 @@ synthesizeScimUser :: ST.ValidScimUser -> Scim.User ST.SparTag
 synthesizeScimUser info =
   let Handle userName = info ^. ST.vsuHandle
       mDisplayName = fromName <$> (info ^. ST.vsuName)
-      toExternalId' :: SAML.UserRef -> Maybe Text
-      toExternalId' = either (const Nothing) Just . Brig.toExternalId . Brig.toUserSSOId
+      toExternalId' :: Maybe SAML.UserRef -> Maybe Text
+      toExternalId' = (>>= either (const Nothing) Just . Brig.toExternalId . Brig.toUserSSOId)
    in (Scim.empty ST.userSchemas userName (ST.ScimUserExtra (info ^. ST.vsuRichInfo)))
         { Scim.externalId = toExternalId' $ info ^. ST.vsuUserRef,
           Scim.displayName = mDisplayName,
