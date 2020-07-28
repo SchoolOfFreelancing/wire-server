@@ -66,7 +66,7 @@ import qualified Spar.Data as Data
 import qualified Spar.Intra.Brig as Brig
 import Spar.Scim.Auth ()
 import qualified Spar.Scim.Types as ST
-import Spar.Types (IdP, ScimTokenInfo (..), derivedOpts, derivedOptsScimBaseURI, richInfoLimit, wiTeam)
+import Spar.Types (IdP, ScimTokenInfo (..), derivedOpts, derivedOptsScimBaseURI, richInfoLimit)
 import qualified System.Logger.Class as Log
 import qualified URI.ByteString as URIBS
 import qualified Web.Scim.Class.User as Scim
@@ -158,11 +158,9 @@ validateScimUser tokinfo user = do
   richInfoLimit <- lift $ asks (richInfoLimit . sparCtxOpts)
   validateScimUser' idpConfig richInfoLimit user
 
-tokenInfoToIdP :: ScimTokenInfo -> Scim.ScimHandler Spar IdP
+tokenInfoToIdP :: ScimTokenInfo -> Scim.ScimHandler Spar (Maybe IdP)
 tokenInfoToIdP ScimTokenInfo {stiIdP} = do
-  iid <- stiIdP ?? Scim.serverError "No IdP configured for the provisioning token"
-  midp <- lift . wrapMonadClient . Data.getIdPConfig $ iid
-  midp ?? Scim.serverError "Unknown IdP configured for the provisioning token"
+  maybe (pure Nothing) (lift . wrapMonadClient . Data.getIdPConfig) stiIdP
 
 -- | Validate a handle (@userName@).
 validateHandle :: MonadError Scim.ScimError m => Text -> m Handle
@@ -202,13 +200,13 @@ validateScimUser' ::
   forall m.
   (MonadError Scim.ScimError m) =>
   -- | IdP that the resulting user will be assigned to
-  IdP ->
+  Maybe IdP ->
   -- | Rich info limit
   Int ->
   Scim.User ST.SparTag ->
   m ST.ValidScimUser
-validateScimUser' idp richInfoLimit user = do
-  uref :: SAML.UserRef <- mkUserRef idp (Scim.externalId user)
+validateScimUser' midp richInfoLimit user = do
+  uref :: Maybe SAML.UserRef <- (\idp -> mkUserRef idp (Scim.externalId user)) `mapM` midp
   handl <- validateHandle . Text.toLower . Scim.userName $ user
   -- FUTUREWORK: 'Scim.userName' should be case insensitive; then the toLower here would
   -- be a little less brittle.
@@ -297,20 +295,12 @@ createValidScimUser ::
   ScimTokenInfo ->
   ST.ValidScimUser ->
   m (Scim.StoredUser ST.SparTag)
-createValidScimUser tokinfo vsu@(ST.ValidScimUser uref handl mbName richInfo active) = do
-  idpConfig <- tokenInfoToIdP tokinfo
-  -- sanity check: do tenant of the URef and the Issuer of the IdP match?  (this is mostly
-  -- here to make sure a refactoring we did in the past is sound: we removed a lookup by
-  -- tenant and had the idp config already in context from an earlier lookup.)
-  () <-
-    let inidp = idpConfig ^. SAML.idpMetadata . SAML.edIssuer
-        inuref = uref ^. SAML.uidTenant
-     in assert (inidp == inuref) $ pure ()
+createValidScimUser ScimTokenInfo {stiTeam} vsu@(ST.ValidScimUser uref handl mbName richInfo active) = do
   -- Generate a UserId will be used both for scim user in spar and for brig.
   buid <- Id <$> liftIO UUID.nextRandom
   -- ensure uniqueness constraints of all affected identifiers.
   -- if we crash now, retry POST will just work
-  assertUserRefUnused uref
+  assertUserRefUnused `mapM_` uref
   assertHandleUnused handl buid
   -- if we crash now, retry POST will just work, or user gets told the handle
   -- is already in use and stops POSTing
@@ -318,8 +308,7 @@ createValidScimUser tokinfo vsu@(ST.ValidScimUser uref handl mbName richInfo act
   -- FUTUREWORK(arianvp): Get rid of manual lifting. Needs to be SCIM instances for ExceptT
   -- This is the pain and the price you pay for the horribleness called MTL
   storedUser <- lift . toScimStoredUser buid $ synthesizeScimUser vsu
-  let teamid = idpConfig ^. SAML.idpExtraInfo . wiTeam
-  buid' <- lift $ Brig.createBrigUser uref buid teamid mbName ManagedByScim
+  buid' <- lift $ Brig.createBrigUser uref buid stiTeam mbName ManagedByScim
   assert (buid == buid') $ pure ()
   -- If we crash now, we have an active user that cannot login. And can not
   -- be bound this will be a zombie user that needs to be manually cleaned
@@ -335,9 +324,9 @@ createValidScimUser tokinfo vsu@(ST.ValidScimUser uref handl mbName richInfo act
 
   -- FUTUREWORK(arianvp): these two actions we probably want to make transactional
   lift . wrapMonadClient $ Data.writeScimUserTimes storedUser
-  lift . wrapMonadClient $ Data.insertSAMLUser uref buid
+  (lift . wrapMonadClient . (`Data.insertSAMLUser` buid)) `mapM_` uref
 
-  lift $ validateEmailIfExists buid uref
+  (lift . (validateEmailIfExists buid)) `mapM_` uref
 
   -- TODO(fisx): suspension has yet another race condition: if we don't reach the following
   -- line, the user will be active.
@@ -374,7 +363,7 @@ updateValidScimUser tokinfo uid newScimUser = do
     Scim.getUser tokinfo uid
   oldValidScimUser :: ST.ValidScimUser <-
     validateScimUser tokinfo . Scim.value . Scim.thing $ oldScimStoredUser
-  assertUserRefNotUsedElsewhere (newScimUser ^. ST.vsuUserRef) uid
+  (`assertUserRefNotUsedElsewhere` uid) `mapM_` (newScimUser ^. ST.vsuUserRef)
   assertHandleNotUsedElsewhere (newScimUser ^. ST.vsuHandle) uid
   if oldValidScimUser == newScimUser
     then pure oldScimStoredUser
@@ -635,15 +624,11 @@ synthesizeStoredUser' ::
   URIBS.URI ->
   MonadError Scim.ScimError m => m (Scim.StoredUser ST.SparTag)
 synthesizeStoredUser' uid ssoid dname handle richInfo accStatus createdAt lastUpdatedAt baseuri = do
-  sso <- do
-    let err = throwError $ Scim.notFound "User" (cs $ show uid) -- See https://github.com/zinfra/backend-issues/issues/1365
-    maybe err pure ssoid
-
   let scimUser :: Scim.User ST.SparTag
       scimUser =
         synthesizeScimUser
           ST.ValidScimUser
-            { ST._vsuUserRef = sso,
+            { ST._vsuUserRef = ssoid,
               ST._vsuHandle = handle, -- 'Maybe' there is one in @usr@, but we want to type checker to make sure this exists.
               ST._vsuName = Just dname,
               ST._vsuRichInfo = richInfo,

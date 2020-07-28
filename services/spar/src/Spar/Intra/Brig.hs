@@ -124,7 +124,7 @@ instance MonadSparToBrig m => MonadSparToBrig (ReaderT r m) where
 createBrigUser ::
   (HasCallStack, MonadSparToBrig m) =>
   -- | SSO identity
-  SAML.UserRef ->
+  Maybe SAML.UserRef ->
   UserId ->
   TeamId ->
   -- | User name (if 'Nothing', the subject ID will be used)
@@ -132,7 +132,8 @@ createBrigUser ::
   -- | Who should have control over the user
   ManagedBy ->
   m UserId
-createBrigUser suid (Id buid) teamid mbName managedBy = do
+createBrigUser Nothing _ _ _ _ = undefined
+createBrigUser (Just suid) (Id buid) teamid mbName managedBy = do
   uname :: Name <- case mbName of
     Just n -> pure n
     Nothing -> do
